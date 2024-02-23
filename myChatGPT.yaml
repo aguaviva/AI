@@ -1,0 +1,11 @@
+use_wandb: False
+learning_rate: 1e-4
+dataset: tinyshakespeare
+dropout: 0.20
+epochs: 1
+iter_eval: 200
+batch_size: 64
+context_size: 256
+num_blocks: 6
+num_heads: 6 
+embedding_size: 384

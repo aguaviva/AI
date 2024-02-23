@@ -1,61 +1,62 @@
 import torch
 import torch.nn as nn
 from  torch.nn import functional as F
+from torch.utils.data import Dataset
+from omegaconf import OmegaConf
 torch.manual_seed(1337)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-import wandb
-wandb.login()
+config = OmegaConf.load('./myChatGPT.yaml')
 
+print(OmegaConf.to_yaml(config))
+
+use_wandb = False
 
 with open("input.txt", "r", encoding = "utf-8") as f:
     text=f.read()
-print(len(text))   
 
 vocab = list(set(text))
 vocab.sort()
 print("".join(vocab))
 vocab_size = len(vocab)
 
-#encoder
 ctoi = { vocab[i]:i for i in range(len(vocab))}
 itoc = { i:vocab[i] for i in range(len(vocab))}
 def encode(s): return [ ctoi[i] for i in s]
 def decode(t): return "".join([ itoc[i] for i in t])
 
-tokens = encode("hi ho")
-s = decode(tokens)
-print(tokens, s)
-
 tokens = encode(text)
 print(tokens[:20])
 print(decode(tokens[:20]))
 
+class CustomDataset(Dataset):
+    def __init__(self, data, block_size):
+        self.data = data
+        self.block_size = block_size
+
+    def __len__(self):
+        return len(self.data) - self.block_size
+
+    def __getitem__(self, idx):        
+        x = self.data[idx:idx + self.block_size]
+        y = self.data[idx+1:idx + self.block_size + 1]
+        return x, y   
+
 data = torch.tensor(tokens, dtype=torch.long, device = device)
 n = int(0.9*len(data))
-train_data = data[:n]
-val_data = data[n:]
+training_set = CustomDataset(data[:n], config.context_size)
+validation_set  = CustomDataset(data[n:], config.context_size)
+    
+training_generator = torch.utils.data.DataLoader(training_set, batch_size = config.batch_size, shuffle=True)  
+validation_generator = torch.utils.data.DataLoader(validation_set, batch_size = config.batch_size, shuffle=False)  
 
-def get_batch(data, batch_size = 4, block_size = 8 ):
-    indices = torch.randint(len(data)-block_size-1, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in indices], dim=0)
-    y = torch.stack([data[i+1:i+block_size+1] for i in indices], dim=0)
-    return x,y   
+for i, (x,y) in enumerate(training_generator):
+    print(i)
+    print(x)
+    print(y)
+    break
 
-x,y =  get_batch(train_data)    
-print(x)
-print(y)
-
-def compute_loss(model, dataset):
-    model.eval()
-    with torch.no_grad():
-        total = 0
-        for i in range(100):   
-            x,y =  get_batch(dataset, 64, model.get_context_size())    
-            _, loss = model(x,y)
-            total += loss
-        model.train()
-        return float((total/100).cpu())
+dropout=0.2
 
 def save_model(model, run_name=""):
     torch.save(model.state_dict(), f"./{model.model.name}_{run_name}.pth")    
@@ -63,27 +64,75 @@ def save_model(model, run_name=""):
 def load_model(model, run_name=""):    
     model.load_state_dict(torch.load(f"./{model.model.name}_{run_name}.pth"))
 
-def train(model, lr, batch_size, iterations, iter_eval):
+def compute_loss(model, generator):
+    model.eval()
+    with torch.no_grad():
+        total = 0
+        for it, (x,y) in enumerate(generator):
+            if it>100:
+                break
+            _, loss = model(x,y)
+            total += loss
+        model.train()
+        return float((total/100).cpu())
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+def train(model, config = {}, notes = "", tags = []):
+    if use_wandb:
+        import wandb
+        wandb.login()
 
-    print(compute_loss(model, train_data), compute_loss(model, val_data))
+        wandb.init(
+            settings = wandb.Settings(start_method="thread"),
+            # set the wandb project where this run will be logged
+            project = "myChatGPT",
+            notes = notes,
+            tags = tags,        
 
-    for it in range(iterations):
-        x,y =  get_batch(train_data, batch_size, model.get_context_size())    
+            # track hyperparameters and run metadata
+            config = config
+        )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr = config.learning_rate)
+
+    path = "best_model.pt"
+
+    try:
+        checkpoint = torch.load(path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    except:
+        pass
+    
+    print(compute_loss(model, training_generator), compute_loss(model, validation_generator))
+
+    best_loss = 1e6
+
+    for it, (x,y) in enumerate(training_generator):
         _, loss = model(x,y)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()    
-        if it % iter_eval == 0:
-            train_loss = compute_loss(model, train_data)
-            val_loss = compute_loss(model, val_data)
-            print(it//iter_eval, train_loss, val_loss)
-            wandb.log({"val_loss": val_loss, "train_loss": train_loss})
+        if it % config.iter_eval == 0:
+            train_loss = compute_loss(model, training_generator)
+            val_loss = compute_loss(model, validation_generator)            
+            if use_wandb:
+                wandb.log({"val_loss": val_loss, "train_loss": train_loss})
+            else:
+                print(it//config.iter_eval, train_loss, val_loss)
+
+            if (val_loss<best_loss):
+                best_loss = val_loss
+                torch.save({
+                            'config': config,
+                            'iteration': it,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'val_loss': val_loss,
+                            'train_loss': train_loss,
+                            }, path)                
         
-
-
-loss_fn = nn.CrossEntropyLoss()
+    if use_wandb:
+        wandb.finish()
 
 class Attention(nn.Module):
     def __init__(self, context_size, input_size, output_size):
@@ -117,23 +166,24 @@ class Attention(nn.Module):
 
         att = F.softmax(att, dim=-1)
         return att @ em_value 
+    
 
 class Block(nn.Module):
-    def __init__(self, context_size, num_heads, embedding_size):
+    def __init__(self):
         super().__init__()
 
-        self.ln1 = nn.LayerNorm(embedding_size)
+        self.ln1 = nn.LayerNorm(config.embedding_size)
 
-        self.head = nn.ModuleList( [Attention(context_size, embedding_size, embedding_size//num_heads) for _ in range(num_heads)])
-        self.linear = nn.Linear(embedding_size, embedding_size)
+        self.head = nn.ModuleList( [Attention(config.context_size, config.embedding_size, config.embedding_size//config.num_heads) for _ in range(config.num_heads)])
+        self.linear = nn.Linear(config.embedding_size, config.embedding_size)
         self.dp1 = nn.Dropout(dropout)
         
-        self.ln2 = nn.LayerNorm(embedding_size)
+        self.ln2 = nn.LayerNorm(config.embedding_size)
 
         self.ff = nn.Sequential(
-            nn.Linear(embedding_size, 4 * embedding_size),
+            nn.Linear(config.embedding_size, 4 * config.embedding_size),
             nn.ReLU(),
-            nn.Linear(4 * embedding_size, embedding_size),
+            nn.Linear(4 * config.embedding_size, config.embedding_size),
             nn.Dropout(dropout),
         )
 
@@ -153,20 +203,18 @@ class Block(nn.Module):
 
 
 class ChatGPT(nn.Module):
-    def __init__(self, context_size, num_blocks, num_heads, embedding_size):
+    def __init__(self):
         super().__init__()
-        self.name = f"gpt_{context_size}_{num_blocks}_{num_heads}_{embedding_size}"
-        self.context_size = context_size
-        pos = torch.arange(0, context_size, dtype=torch.long)
+        pos = torch.arange(0, config.context_size, dtype=torch.long)
         self.register_buffer("pos", pos)
 
-        self.tok_embedding = nn.Embedding(vocab_size, embedding_size)
-        self.pos_embedding = nn.Embedding(context_size, embedding_size)
+        self.tok_embedding = nn.Embedding(vocab_size, config.embedding_size)
+        self.pos_embedding = nn.Embedding(config.context_size, config.embedding_size)
 
-        self.blocks = nn.Sequential( *[Block(context_size, num_heads, embedding_size) for _ in range(num_blocks)])
+        self.blocks = nn.Sequential( *[Block() for _ in range(config.num_blocks)])
 
-        self.ln = nn.LayerNorm(embedding_size) # final layer norm
-        self.linear = nn.Linear(embedding_size, vocab_size)
+        self.ln = nn.LayerNorm(config.embedding_size) # final layer norm
+        self.linear = nn.Linear(config.embedding_size, vocab_size)
 
     def forward(self, x):
         
@@ -180,6 +228,8 @@ class ChatGPT(nn.Module):
         x = self.linear(x)
 
         return x
+
+loss_fn = nn.CrossEntropyLoss()    
 
 class Generator(nn.Module):
     def __init__(self, model):
@@ -216,47 +266,8 @@ class Generator(nn.Module):
 
     def get_context_size(self):
         return self.model.context_size
-    
 
-
-lr = 0.001
-dropout = 0.2
-iterations = 7000
-iter_eval=200
-batch_size=64
-context_size = 256
-num_blocks = 6
-num_heads = 6
-embedding_size = 6*64
-notes = "overfitting"
-
-gen = ChatGPT(context_size, num_blocks, num_heads, embedding_size)
-model = Generator(gen).to(device)
-
-config={
-"lr": lr,
-"dataset": "tinyshakespeare",
-"dropout" : dropout, 
-"iterations": iterations,
-"iter_eval": iter_eval,
-"batch_size": batch_size,
-"context_size": context_size,
-"num_blocks": num_blocks,
-"num_heads": num_heads,
-"embedding_size": embedding_size
-}
-
-wandb.init(
-    settings=wandb.Settings(start_method="thread"),
-    # set the wandb project where this run will be logged
-    project="myChatGPT",
-    notes = notes,
-    config = config
-    # track hyperparameters and run metadata
-)
-
-train(model, lr, batch_size, iterations, iter_eval)
-
-print(model.generate(2000))
-
-wandb.finish()
+cg = Generator(ChatGPT()).to(device)
+#cg.load_state_dict(torch.load(gen.name+".pth"))
+train(cg, config, notes = "overfit", tags=[] )
+print(cg.generate(1500))                
