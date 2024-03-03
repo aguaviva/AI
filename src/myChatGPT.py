@@ -31,18 +31,19 @@ class CustomDataset(Dataset):
         self.context_size = context_size
 
     def __len__(self):
-        return len(self.data) - self.context_size - 1
+        return len(self.data) - self.context_size
 
     def __getitem__(self, idx):        
         if idx >= len(self): raise IndexError   
         x = self.data[idx:idx + self.context_size]
-        y = self.data[idx+1:idx + self.context_size + 1]
+        y = self.data[idx+1:idx + self.context_size+1]
         return x, y   
+
 
 data = torch.tensor(tokens, dtype=torch.long, device = device)
 n = int(0.9*len(data))
-
-training_set = CustomDataset(data[:n], config.context_size)
+training_data = data[:n]
+training_set = CustomDataset(training_data, config.context_size)
 validation_set  = CustomDataset(data[n:], config.context_size)
     
 training_generator = torch.utils.data.DataLoader(training_set, batch_size = config.batch_size, shuffle=True)  
