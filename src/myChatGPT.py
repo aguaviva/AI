@@ -1,33 +1,38 @@
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 from  torch.nn import functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, random_split
 from omegaconf import OmegaConf
+from model import Generator
+
 torch.manual_seed(1337)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 config = OmegaConf.load('./config/myChatGPT.yaml')
 
-with open("data/input.txt", "r", encoding = "utf-8") as f:
-    text=f.read()
 
-vocab = list(set(text))
-vocab.sort()
-print("".join(vocab))
-vocab_size = len(vocab)
+class Tokenizer:
+    def __init__(self, text):
+        self.vocab = list(set(text))
+        self.vocab.sort()
 
-ctoi = { vocab[i]:i for i in range(len(vocab))}
-itoc = { i:vocab[i] for i in range(len(vocab))}
-def encode(s): return [ ctoi[i] for i in s]
-def decode(t): return "".join([ itoc[i] for i in t])
+        self.ctoi = { self.vocab[i]:i for i in range(len(self.vocab)) }
+        self.itoc = { i:self.vocab[i] for i in range(len(self.vocab)) }
 
-tokens = encode(text)
-#print(tokens[:20])
-#print(decode(tokens[:20]))
+    def get_vocab_size(self):
+        return len(self.vocab)
+
+    def encode(self, s): 
+        return [ self.ctoi[i] for i in s ]
+
+    def decode(self, t): 
+        return "".join([ self.itoc[i] for i in t ])
+
 
 class CustomDataset(Dataset):
-    def __init__(self, data, context_size):
-        self.data = data
+    def __init__(self, tokens, context_size):
+        self.data = torch.tensor(tokens, dtype=torch.long, device = device)
         self.context_size = context_size
 
     def __len__(self):
@@ -40,28 +45,19 @@ class CustomDataset(Dataset):
         return x, y   
 
 
-data = torch.tensor(tokens, dtype=torch.long, device = device)
-n = int(0.9*len(data))
-training_data = data[:n]
-training_set = CustomDataset(training_data, config.context_size)
-validation_set  = CustomDataset(data[n:], config.context_size)
-    
-training_generator = torch.utils.data.DataLoader(training_set, batch_size = config.batch_size, shuffle=True)  
-validation_generator = torch.utils.data.DataLoader(validation_set, batch_size = config.batch_size, shuffle=False)  
-
 def compute_loss(model, generator):
     model.eval()
     with torch.no_grad():
         total = 0
-        for it, (x,y) in enumerate(generator):
-            if it>100:
-                break
-            _, loss = model(x,y)
-            total += loss
+        with tqdm(total=len(generator)) as pbar:
+            for x,y in generator:
+                _, loss = model(x,y)
+                total += loss
+                pbar.update(1)
         model.train()
-        return float((total/100).cpu())
+        return float((total/len(generator.dataset)).cpu())
 
-def train(model, optimizer, training_generator, config = {}):
+def train(model, optimizer, dataset, config = {}):
     if config.use_wandb:
         import wandb
         wandb.login()
@@ -77,7 +73,20 @@ def train(model, optimizer, training_generator, config = {}):
             #config = config
         )
 
-    print(compute_loss(model, training_generator), compute_loss(model, validation_generator))
+    generator = torch.Generator().manual_seed(42)
+    training_set, validation_set = random_split(dataset, [0.9, 0.1], generator=generator)
+
+    training_generator = torch.utils.data.DataLoader(training_set, batch_size = config.batch_size, shuffle=True)  
+    validation_generator = torch.utils.data.DataLoader(validation_set, batch_size = config.batch_size, shuffle=False)  
+
+    if config.resume_training:
+        checkpoint = torch.load(config.model_path)
+        print(f" train_loss: {checkpoint['train_loss']}")
+        print(f" val_loss: {checkpoint['val_loss']}")
+
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        torch.set_rng_state(checkpoint['rng_state'])       
 
     best_loss = 1e6
 
@@ -89,7 +98,8 @@ def train(model, optimizer, training_generator, config = {}):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()    
-        if it % config.iter_eval == 0:
+
+        if (it == 0) or (it % config.iter_eval) == 0:
             train_loss = compute_loss(model, training_generator)
             val_loss = compute_loss(model, validation_generator)            
             if config.use_wandb:
@@ -112,159 +122,32 @@ def train(model, optimizer, training_generator, config = {}):
     if config.use_wandb:
         wandb.finish()
 
-class Attention(nn.Module):
-    def __init__(self, context_size, input_size, output_size):
-        super().__init__()
-        # KQV size
-        self.output_size = output_size
-        self.key = nn.Linear(input_size, output_size, bias=False)
-        self.query = nn.Linear(input_size, output_size, bias=False)
-        self.value = nn.Linear(input_size, output_size, bias=False)
-
-        sz = context_size
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        self.register_buffer("mask", mask)
-
-    def forward(self, x):
-        em_key = self.key(x)
-        em_query = self.query(x)
-        em_value = self.value(x)
-
-        # the attentions matrix must be the size of the context
-        # as it is in reality an adjacency matrix
-        att = em_query @ em_key.transpose(-2,-1)
-
-        #print (att.shape)
-
-        att /= self.output_size ** 0.5
-
-        att += self.mask
-
-        att = F.softmax(att, dim=-1)
-        return att @ em_value 
-    
-class Block(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.ln1 = nn.LayerNorm(config.embedding_size)
-
-        self.head = nn.ModuleList( [Attention(config.context_size, config.embedding_size, config.embedding_size//config.num_heads) for _ in range(config.num_heads)])
-        self.linear = nn.Linear(config.embedding_size, config.embedding_size)
-        self.dp1 = nn.Dropout(config.dropout)
-        
-        self.ln2 = nn.LayerNorm(config.embedding_size)
-
-        self.ff = nn.Sequential(
-            nn.Linear(config.embedding_size, 4 * config.embedding_size),
-            nn.ReLU(),
-            nn.Linear(4 * config.embedding_size, config.embedding_size),
-            nn.Dropout(config.dropout),
-        )
-
-    def forward(self, x):
-
-        lx = self.ln1(x)
-        x1 = self.linear(torch.cat([head(lx) for head in self.head], dim=-1))
-        x1 = self.dp1(x1)
-        x = x + x1
-        
-        lx = self.ln2(x)
-        x2 = self.ff(lx)
-        x = x + x2
-
-        return x
-
-class ChatGPT(nn.Module):
-    def __init__(self):
-        super().__init__()
-        pos = torch.arange(0, config.context_size, dtype=torch.long)
-        self.register_buffer("pos", pos)
-
-        self.tok_embedding = nn.Embedding(vocab_size, config.embedding_size)
-        self.pos_embedding = nn.Embedding(config.context_size, config.embedding_size)
-
-        self.blocks = nn.Sequential( *[Block() for _ in range(config.num_blocks)])
-
-        self.ln = nn.LayerNorm(config.embedding_size) # final layer norm
-        self.linear = nn.Linear(config.embedding_size, vocab_size)
-
-    def forward(self, x):
-        
-        te = self.tok_embedding(x)
-        pe = self.pos_embedding(self.pos)
-        x = te + pe
-
-        x = self.blocks(x)
-        x = self.ln(x)
-
-        x = self.linear(x)
-
-        return x
-
-loss_fn = nn.CrossEntropyLoss()
-
-class Generator(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x, y = None):
-        p = self.model(x)
-        if y!=None:
-            ly = F.one_hot(y, vocab_size).type(torch.float32)
-            loss = loss_fn(p.permute(0,2,1), ly.permute(0,2,1))
-        else:
-            loss = None
-        return p, loss
-
-    def generate(self, count, str=" "):
-        self.eval()
-        with torch.no_grad():
-            s = torch.zeros((1, config.context_size), dtype=torch.long).to(device)
-
-            prompt = torch.tensor([encode(str)], dtype=torch.long, device = device)
-            prompt_len = len(str)
-
-            s[0, -prompt_len:] = prompt
-            out = s
-            for i in range(count):
-                p, _ = self.forward(out[:,-config.context_size:])
-                probs = F.softmax(p, dim=-1)
-                s = torch.multinomial(probs[0],1)
-                out = torch.cat([out, s[-1].unsqueeze(1)], dim=1)
-
-            return decode(out[0].tolist()[config.context_size - prompt_len:])
-        self.train()
-
-
-def get_model():
-    model = Generator(ChatGPT()).to(device)   
-    return model
-
 if __name__ == '__main__':
-    
-    model = get_model()
+
+    with open("data/input.txt", "r", encoding = "utf-8") as f:
+        text=f.read()
+
+    tok = Tokenizer(text)
+
+    dataset = CustomDataset(tok.encode(text), config.context_size)
+
+    model = Generator(tok.get_vocab_size(), config).to(device) 
+
+    print("trainable parameter count: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+
     optimizer = torch.optim.AdamW(model.parameters(), lr = config.learning_rate)
 
+    train(model, optimizer, dataset, config)
     """
-    try:
-        checkpoint = torch.load(config.model_path)
-        print(f" train_loss: {checkpoint['train_loss']}")
-        print(f" val_loss: {checkpoint['val_loss']}")
-
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        #torch.set_rng_state(checkpoint['rng_state'])       
-    except:
-        print("no checkpoint")
-        pass
+    from torch.profiler import profile, record_function, ProfilerActivity
+    with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+        with record_function("model_inference"):
+            #train(model, optimizer, dataset, config)
+            print(tok.decode(model.generate(200, tok.encode(" "))))
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+    prof.export_chrome_trace("trace.json")
     """
-    config.name = "baseline 1"
-
-    train(model, optimizer, training_generator, config)
-
-    print(model.generate(200))
+    print(tok.decode(model.generate(200, tok.encode(" "))))
    
     

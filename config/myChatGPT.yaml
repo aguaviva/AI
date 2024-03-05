@@ -1,7 +1,7 @@
-use_wandb: True
+use_wandb: False
 project: myChatGPT
 notes: baseline
-tags: []
+tags: [baseline]
 model_path: best_model.pt
 learning_rate: 1e-4
 dataset: tinyshakespeare
@@ -14,3 +14,4 @@ context_size: 256
 num_blocks: 6
 num_heads: 6 
 embedding_size: 384
+resume_training: False
