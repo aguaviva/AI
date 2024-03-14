@@ -118,7 +118,7 @@ class Generator(nn.Module):
     def generate(self, count, tokens):
         self.eval()
         with torch.no_grad():
-            s = torch.zeros((1, self.context_size), dtype=torch.long)
+            s = torch.zeros((1, self.context_size), dtype=torch.long, device = device)
 
             prompt = torch.tensor([tokens], dtype=torch.long, device = device)
             prompt_len = len(tokens)

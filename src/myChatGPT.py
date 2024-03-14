@@ -5,30 +5,12 @@ from  torch.nn import functional as F
 from torch.utils.data import Dataset, random_split
 from omegaconf import OmegaConf
 from model import Generator
+from tokenizer import Tokenizer, Tokenizer2
 
 torch.manual_seed(1337)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 config = OmegaConf.load('./config/myChatGPT.yaml')
-
-
-class Tokenizer:
-    def __init__(self, text):
-        self.vocab = list(set(text))
-        self.vocab.sort()
-
-        self.ctoi = { self.vocab[i]:i for i in range(len(self.vocab)) }
-        self.itoc = { i:self.vocab[i] for i in range(len(self.vocab)) }
-
-    def get_vocab_size(self):
-        return len(self.vocab)
-
-    def encode(self, s): 
-        return [ self.ctoi[i] for i in s ]
-
-    def decode(self, t): 
-        return "".join([ self.itoc[i] for i in t ])
-
 
 class CustomDataset(Dataset):
     def __init__(self, tokens, context_size):
@@ -45,17 +27,21 @@ class CustomDataset(Dataset):
         return x, y   
 
 
-def compute_loss(model, generator):
+def compute_loss(model, generator, iterations=1024):
     model.eval()
     with torch.no_grad():
+
+        iterations = min(len(generator.dataset), int(iterations))
         total = 0
-        with tqdm(total=len(generator)) as pbar:
-            for x,y in generator:
+        with tqdm(total=iterations) as pbar:
+            for i, (x,y) in enumerate(generator):
+                if i>iterations:
+                    break
                 _, loss = model(x,y)
                 total += loss
                 pbar.update(1)
         model.train()
-        return float((total/len(generator.dataset)).cpu())
+        return float((total/iterations).cpu())
 
 def train(model, optimizer, dataset, config = {}):
     if config.use_wandb:
@@ -78,15 +64,6 @@ def train(model, optimizer, dataset, config = {}):
 
     training_generator = torch.utils.data.DataLoader(training_set, batch_size = config.batch_size, shuffle=True)  
     validation_generator = torch.utils.data.DataLoader(validation_set, batch_size = config.batch_size, shuffle=False)  
-
-    if config.resume_training:
-        checkpoint = torch.load(config.model_path)
-        print(f" train_loss: {checkpoint['train_loss']}")
-        print(f" val_loss: {checkpoint['val_loss']}")
-
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        torch.set_rng_state(checkpoint['rng_state'])       
 
     best_loss = 1e6
 
@@ -123,31 +100,53 @@ def train(model, optimizer, dataset, config = {}):
         wandb.finish()
 
 if __name__ == '__main__':
-
+   
     with open("data/input.txt", "r", encoding = "utf-8") as f:
         text=f.read()
-
-    tok = Tokenizer(text)
-
-    dataset = CustomDataset(tok.encode(text), config.context_size)
+        text = text.lower()
+    
+    tok = Tokenizer2()
+    tok.compute_vocab(text)
 
     model = Generator(tok.get_vocab_size(), config).to(device) 
-
     print("trainable parameter count: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
+    if config.train:
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr = config.learning_rate)
+        dataset = CustomDataset(tok.encode(text), config.context_size)
+        optimizer = torch.optim.AdamW(model.parameters(), lr = config.learning_rate)
 
-    train(model, optimizer, dataset, config)
-    """
-    from torch.profiler import profile, record_function, ProfilerActivity
-    with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
-        with record_function("model_inference"):
-            #train(model, optimizer, dataset, config)
-            print(tok.decode(model.generate(200, tok.encode(" "))))
-    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
-    prof.export_chrome_trace("trace.json")
-    """
-    print(tok.decode(model.generate(200, tok.encode(" "))))
+        if config.load_last_checkpoint:
+            checkpoint = torch.load(config.model_path)
+            print(f" train_loss: {checkpoint['train_loss']}")
+            print(f" val_loss: {checkpoint['val_loss']}")
+
+            model.load_state_dict(checkpoint['model_state_dict'])
+            torch.set_rng_state(checkpoint['rng_state'])       
+
+        
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        train(model, optimizer, dataset, config)
+
+    else:
+        if config.load_last_checkpoint:
+            checkpoint = torch.load(config.model_path)
+            print(f" train_loss: {checkpoint['train_loss']}")
+            print(f" val_loss: {checkpoint['val_loss']}")
+
+            model.load_state_dict(checkpoint['model_state_dict'])
+
+
+    if False:
+        from torch.profiler import profile, record_function, ProfilerActivity
+        with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+            with record_function("model_inference"):
+                #train(model, optimizer, dataset, config)
+                print(tok.decode(model.generate(200, tok.encode(" "))))
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+        prof.export_chrome_trace("trace.json")
+
+    print(tok.decode(model.generate(1024, tok.encode("please dont kill me ") )))
    
     

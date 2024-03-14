@@ -8,10 +8,12 @@ dataset: tinyshakespeare
 dropout: 0.20
 epochs: 1
 iterations: 10000
-iter_eval: 200
+iter_eval: 500
 batch_size: 64
 context_size: 256
 num_blocks: 6
 num_heads: 6 
 embedding_size: 384
-resume_training: False
+train: True
+load_last_checkpoint: True
+
